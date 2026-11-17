@@ -1,0 +1,120 @@
+# Teste l'agent d'un SaaS sur des machines Windows et Linux jetables (runners GitHub).
+#
+# Secrets à créer (Settings > Secrets and variables > Actions > Secrets) :
+#   LINUX_AGENT_INSTALL_CMD    commande bash d'installation de l'agent (exécutée en root)
+#   WINDOWS_AGENT_INSTALL_CMD  commande PowerShell d'installation de l'agent (exécutée en admin)
+#
+# Variables facultatives (onglet "Variables") :
+#   LINUX_AGENT_SERVICE        nom du service systemd de l'agent, pour vérifier qu'il tourne
+#   WINDOWS_AGENT_SERVICE      nom du service Windows de l'agent
+#   LINUX_AGENT_UNINSTALL_CMD  commande de désinstallation (pour ne pas laisser d'agent "fantôme" dans le SaaS)
+#   WINDOWS_AGENT_UNINSTALL_CMD
+
+name: Test agent SaaS (Windows + Linux)
+
+on:
+  workflow_dispatch:
+    inputs:
+      duree_minutes:
+        description: "Durée pendant laquelle les machines restent allumées pour vos tests depuis le SaaS (max 330)"
+        required: true
+        default: "30"
+      systemes:
+        description: "Systèmes à tester"
+        required: true
+        default: "tous"
+        type: choice
+        options: [tous, linux, windows]
+  # Décommentez pour un test automatique chaque jour ouvré à 7 h UTC (durée courte) :
+  # schedule:
+  #   - cron: "0 7 * * 1-5"
+
+permissions:
+  contents: read
+
+jobs:
+  test-agent:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 350 # un job GitHub ne peut pas dépasser 6 h
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04, windows-2025, windows-2022]
+    env:
+      CHOIX: ${{ github.event.inputs.systemes || 'tous' }}
+      DUREE: ${{ github.event.inputs.duree_minutes || '10' }}
+
+    steps:
+      - name: Filtrer selon le choix
+        id: filtre
+        shell: bash
+        run: |
+          famille=$([[ "${{ runner.os }}" == "Windows" ]] && echo windows || echo linux)
+          if [[ "$CHOIX" == "tous" || "$CHOIX" == "$famille" ]]; then echo "go=true" >> "$GITHUB_OUTPUT"; else echo "go=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Infos machine
+        if: steps.filtre.outputs.go == 'true'
+        shell: bash
+        run: |
+          echo "Nom d'hôte : $(hostname)"
+          echo "OS         : ${{ matrix.os }}"
+          echo "IP sortante: $(curl -s https://api.ipify.org || echo inconnue)"
+
+      # ------------------------------------------------------------ Linux
+      - name: Installer l'agent (Linux)
+        if: steps.filtre.outputs.go == 'true' && runner.os == 'Linux'
+        env:
+          AGENT_CMD: ${{ secrets.LINUX_AGENT_INSTALL_CMD }}
+        run: |
+          if [ -z "$AGENT_CMD" ]; then echo "::error::Secret LINUX_AGENT_INSTALL_CMD manquant"; exit 1; fi
+          sudo -E bash -c "$AGENT_CMD"
+
+      - name: Vérifier le service (Linux)
+        if: steps.filtre.outputs.go == 'true' && runner.os == 'Linux' && vars.LINUX_AGENT_SERVICE != ''
+        run: |
+          sleep 15
+          systemctl is-active --quiet "${{ vars.LINUX_AGENT_SERVICE }}" \
+            && echo "Agent actif" \
+            || { sudo journalctl -u "${{ vars.LINUX_AGENT_SERVICE }}" --no-pager -n 50; exit 1; }
+
+      # ------------------------------------------------------------ Windows
+      - name: Installer l'agent (Windows)
+        if: steps.filtre.outputs.go == 'true' && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          AGENT_CMD: ${{ secrets.WINDOWS_AGENT_INSTALL_CMD }}
+        run: |
+          if (-not $env:AGENT_CMD) { Write-Error "Secret WINDOWS_AGENT_INSTALL_CMD manquant"; exit 1 }
+          Invoke-Expression $env:AGENT_CMD
+
+      - name: Vérifier le service (Windows)
+        if: steps.filtre.outputs.go == 'true' && runner.os == 'Windows' && vars.WINDOWS_AGENT_SERVICE != ''
+        shell: pwsh
+        run: |
+          Start-Sleep -Seconds 15
+          $s = Get-Service -Name "${{ vars.WINDOWS_AGENT_SERVICE }}" -ErrorAction Stop
+          if ($s.Status -ne 'Running') { Write-Error "Agent non démarré : $($s.Status)"; exit 1 }
+          Write-Host "Agent actif"
+
+      # ------------------------------------------------------------ Fenêtre de test
+      - name: Machine disponible pour vos tests depuis le SaaS
+        if: steps.filtre.outputs.go == 'true'
+        shell: bash
+        run: |
+          d=$DUREE; [ "$d" -gt 330 ] && d=330
+          echo "La machine $(hostname) reste allumée $d minutes. Lancez vos tests depuis le SaaS."
+          echo "Pour arrêter plus tôt : bouton 'Cancel workflow' dans l'onglet Actions."
+          for i in $(seq 1 "$d"); do sleep 60; echo "… $i/$d min"; done
+
+      # ------------------------------------------------------------ Nettoyage
+      - name: Désinstaller l'agent (Linux)
+        if: always() && steps.filtre.outputs.go == 'true' && runner.os == 'Linux' && vars.LINUX_AGENT_UNINSTALL_CMD != ''
+        continue-on-error: true
+        run: sudo bash -c "${{ vars.LINUX_AGENT_UNINSTALL_CMD }}"
+
+      - name: Désinstaller l'agent (Windows)
+        if: always() && steps.filtre.outputs.go == 'true' && runner.os == 'Windows' && vars.WINDOWS_AGENT_UNINSTALL_CMD != ''
+        continue-on-error: true
+        shell: pwsh
+        run: Invoke-Expression "${{ vars.WINDOWS_AGENT_UNINSTALL_CMD }}"
